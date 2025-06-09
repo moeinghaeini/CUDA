@@ -3,6 +3,7 @@
 #include <vector>
 #include <random>
 #include <chrono>
+#include <numeric>
 
 class Timer {
     std::chrono::time_point<std::chrono::high_resolution_clock> start;
@@ -16,13 +17,13 @@ public:
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <vector_size>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <array_size>" << std::endl;
         return 1;
     }
 
     int n = std::stoi(argv[1]);
     if (n <= 0) {
-        std::cerr << "Error: Vector size must be positive." << std::endl;
+        std::cerr << "Error: Array size must be positive." << std::endl;
         return 1;
     }
 
@@ -44,7 +45,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    MTL::Function* kernel = library->newFunction("vectorAdd");
+    MTL::Function* kernel = library->newFunction("reduce");
     MTL::ComputePipelineState* pipeline = device->newComputePipelineState(kernel, &error);
     if (!pipeline) {
         std::cerr << "Error: Failed to create pipeline: " << error->localizedDescription()->utf8String() << std::endl;
@@ -52,34 +53,34 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize input data
-    std::vector<float> h_a(n);
-    std::vector<float> h_b(n);
-    std::vector<float> h_c(n);
-    std::vector<float> h_c_cpu(n);
-
+    std::vector<float> h_data(n);
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
 
     for (int i = 0; i < n; ++i) {
-        h_a[i] = dis(gen);
-        h_b[i] = dis(gen);
+        h_data[i] = dis(gen);
     }
 
-    // CPU computation
+    // CPU reduction
+    float cpu_result;
     {
         Timer timer;
-        for (int i = 0; i < n; ++i) {
-            h_c_cpu[i] = h_a[i] + h_b[i];
-        }
+        cpu_result = std::accumulate(h_data.begin(), h_data.end(), 0.0f);
         double cpu_time = timer.elapsed();
-        std::cout << "CPU Vector addition took: " << cpu_time << " ms" << std::endl;
+        std::cout << "CPU Reduction took: " << cpu_time << " ms" << std::endl;
+        std::cout << "CPU Result: " << cpu_result << std::endl;
     }
 
+    // GPU reduction setup
+    const int threadsPerBlock = 256;
+    const int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+    std::vector<float> h_partial_sums(blocksPerGrid);
+
     // Create buffers
-    MTL::Buffer* bufferA = device->newBuffer(h_a.data(), n * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* bufferB = device->newBuffer(h_b.data(), n * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* bufferC = device->newBuffer(h_c.data(), n * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bufferInput = device->newBuffer(h_data.data(), n * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bufferOutput = device->newBuffer(h_partial_sums.data(), blocksPerGrid * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bufferResult = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
 
     // Create command buffer and compute command encoder
     MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
@@ -87,13 +88,13 @@ int main(int argc, char* argv[]) {
 
     // Set pipeline and buffers
     computeEncoder->setComputePipelineState(pipeline);
-    computeEncoder->setBuffer(bufferA, 0, 0);
-    computeEncoder->setBuffer(bufferB, 0, 1);
-    computeEncoder->setBuffer(bufferC, 0, 2);
+    computeEncoder->setBuffer(bufferInput, 0, 0);
+    computeEncoder->setBuffer(bufferOutput, 0, 1);
+    computeEncoder->setBuffer(bufferResult, 0, 2);
 
     // Calculate grid and thread size
     MTL::Size gridSize = MTL::Size(n, 1, 1);
-    MTL::Size threadGroupSize = MTL::Size(256, 1, 1);
+    MTL::Size threadGroupSize = MTL::Size(threadsPerBlock, 1, 1);
 
     // Dispatch threads
     {
@@ -103,28 +104,40 @@ int main(int argc, char* argv[]) {
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
         double gpu_time = timer.elapsed();
-        std::cout << "GPU Vector addition took: " << gpu_time << " ms" << std::endl;
+        std::cout << "GPU Kernel execution took: " << gpu_time << " ms" << std::endl;
     }
 
-    // Verify results
-    bool match = true;
-    float epsilon = std::numeric_limits<float>::epsilon() * n;
-    for (int i = 0; i < n; ++i) {
-        if (std::abs(h_c[i] - h_c_cpu[i]) > epsilon) {
-            std::cerr << "Mismatch found at index " << i << ": GPU=" << h_c[i]
-                      << ", CPU=" << h_c_cpu[i] << std::endl;
-            match = false;
-            break;
-        }
+    // Final reduction on CPU
+    float gpu_result;
+    {
+        Timer timer;
+        gpu_result = std::accumulate(h_partial_sums.begin(), h_partial_sums.end(), 0.0f);
+        double final_reduction_time = timer.elapsed();
+        std::cout << "Final reduction on CPU took: " << final_reduction_time << " ms" << std::endl;
     }
-    if (match) {
+
+    std::cout << "GPU Result: " << gpu_result << std::endl;
+
+    // Verify results
+    float tolerance = std::numeric_limits<float>::epsilon() * n * 1000;
+    float diff = std::abs(cpu_result - gpu_result);
+
+    std::cout << "\nVerification:" << std::endl;
+    std::cout << "  CPU Result = " << cpu_result << std::endl;
+    std::cout << "  GPU Result = " << gpu_result << std::endl;
+    std::cout << "  Difference = " << diff << std::endl;
+    std::cout << "  Tolerance  = " << tolerance << std::endl;
+
+    if (diff <= tolerance) {
         std::cout << "Results match!" << std::endl;
+    } else {
+        std::cerr << "Results mismatch!" << std::endl;
     }
 
     // Cleanup
-    bufferA->release();
-    bufferB->release();
-    bufferC->release();
+    bufferInput->release();
+    bufferOutput->release();
+    bufferResult->release();
     pipeline->release();
     kernel->release();
     library->release();

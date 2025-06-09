@@ -6,6 +6,8 @@
 #include <cuda_runtime.h> // CUDA runtime API
 #include <cmath> // For fabs in comparison
 #include <limits> // For numeric_limits
+#include <vector>
+#include <memory>
 
 #include "time.h" // Include the timing header
 
@@ -19,8 +21,11 @@ inline void checkCudaErrors(cudaError_t err, const char *file, int line) {
 }
 #define CHECK_CUDA_ERROR(err) (checkCudaErrors(err, __FILE__, __LINE__))
 
-// CUDA Kernel for vector addition
-__global__ void vectorAddKernel(const double *a, const double *b, double *c, int n) {
+// CUDA Kernel for vector addition with improved memory coalescing
+__global__ void vectorAddKernel(const double *__restrict__ a, 
+                               const double *__restrict__ b, 
+                               double *__restrict__ c, 
+                               int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         c[i] = a[i] + b[i];
@@ -29,10 +34,36 @@ __global__ void vectorAddKernel(const double *a, const double *b, double *c, int
 
 // CPU Kernel for vector addition
 void vectorAddCPU(const double *a, const double *b, double *c, int n) {
+    #pragma omp parallel for
     for (int i = 0; i < n; ++i) {
         c[i] = a[i] + b[i];
     }
 }
+
+// RAII wrapper for CUDA memory
+class CudaMemory {
+public:
+    CudaMemory(size_t size) : size_(size) {
+        CHECK_CUDA_ERROR(cudaMalloc(&ptr_, size));
+    }
+    
+    ~CudaMemory() {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+    
+    void* get() { return ptr_; }
+    const void* get() const { return ptr_; }
+    
+    // Prevent copying
+    CudaMemory(const CudaMemory&) = delete;
+    CudaMemory& operator=(const CudaMemory&) = delete;
+    
+private:
+    void* ptr_ = nullptr;
+    size_t size_;
+};
 
 int main(int argc, char *argv[]) {
     int n;
@@ -59,90 +90,73 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- Host Memory Allocation ---
-    size_t size = n * sizeof(double);
-    double *h_a = (double*)malloc(size);
-    double *h_b = (double*)malloc(size);
-    double *h_c_gpu = (double*)malloc(size); // Result from GPU
-    double *h_c_cpu = (double*)malloc(size); // Result from CPU
+    // Use RAII for host memory management
+    std::vector<double> h_a(n);
+    std::vector<double> h_b(n);
+    std::vector<double> h_c_gpu(n);
+    std::vector<double> h_c_cpu(n);
 
-    // Check if host allocation succeeded
-    if (h_a == nullptr || h_b == nullptr || h_c_gpu == nullptr || h_c_cpu == nullptr) {
-        std::cerr << "Error: Host memory allocation failed." << std::endl;
-        free(h_a); free(h_b); free(h_c_gpu); free(h_c_cpu);
-        return 1;
-    }
-
-    // --- Host Data Initialization ---
+    // Initialize input data
     srand(static_cast<unsigned int>(time(0)));
     for (int i = 0; i < n; ++i) {
-        h_a[i] = (double)rand() / RAND_MAX;
-        h_b[i] = (double)rand() / RAND_MAX;
+        h_a[i] = static_cast<double>(rand()) / RAND_MAX;
+        h_b[i] = static_cast<double>(rand()) / RAND_MAX;
     }
 
-    // --- CPU Vector Addition and Timing ---
+    // CPU Vector Addition and Timing
     timing::tic();
-    vectorAddCPU(h_a, h_b, h_c_cpu, n);
+    vectorAddCPU(h_a.data(), h_b.data(), h_c_cpu.data(), n);
     double cpu_duration_ms = timing::toc();
     std::cout << "CPU Vector addition took: " << cpu_duration_ms << " ms" << std::endl;
 
-    // --- Device Memory Allocation ---
-    double *d_a = nullptr;
-    double *d_b = nullptr;
-    double *d_c = nullptr;
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_a, size));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_b, size));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_c, size));
+    // GPU Vector Addition
+    size_t size = n * sizeof(double);
+    
+    // Use RAII for device memory management
+    CudaMemory d_a(size);
+    CudaMemory d_b(size);
+    CudaMemory d_c(size);
 
-    // --- Copy Data from Host to Device ---
-    CHECK_CUDA_ERROR(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_a.get(), h_a.data(), size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_b.get(), h_b.data(), size, cudaMemcpyHostToDevice));
 
-    // --- Kernel Launch Configuration ---
+    // Configure kernel launch
     int threadsPerBlock = 256;
-    // Ensure sufficient blocks, handling cases where n is not a multiple of threadsPerBlock
     int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
 
-    // --- Kernel Execution and Timing ---
+    // Execute kernel and time it
     timing::tic();
-    vectorAddKernel<<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, n);
-    // Check for errors during kernel launch (optional but recommended)
+    vectorAddKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        static_cast<const double*>(d_a.get()),
+        static_cast<const double*>(d_b.get()),
+        static_cast<double*>(d_c.get()),
+        n
+    );
     CHECK_CUDA_ERROR(cudaGetLastError());
-    // Wait for the kernel to complete
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     double gpu_duration_ms = timing::toc();
 
-    // Print the time taken for kernel execution
     std::cout << "CUDA Kernel execution took: " << gpu_duration_ms << " ms" << std::endl;
+    std::cout << "Speedup: " << cpu_duration_ms / gpu_duration_ms << "x" << std::endl;
 
-    // --- Copy Result from Device to Host ---
-    CHECK_CUDA_ERROR(cudaMemcpy(h_c_gpu, d_c, size, cudaMemcpyDeviceToHost));
+    // Copy result back to host
+    CHECK_CUDA_ERROR(cudaMemcpy(h_c_gpu.data(), d_c.get(), size, cudaMemcpyDeviceToHost));
 
-    // --- Verify Results ---
+    // Verify results
     bool match = true;
-    double epsilon = std::numeric_limits<double>::epsilon() * n; // Tolerance for floating point comparison
+    double epsilon = std::numeric_limits<double>::epsilon() * n;
     for (int i = 0; i < n; ++i) {
         if (std::fabs(h_c_gpu[i] - h_c_cpu[i]) > epsilon) {
             std::cerr << "Mismatch found at index " << i << ": GPU=" << h_c_gpu[i]
                       << ", CPU=" << h_c_cpu[i] << std::endl;
             match = false;
-            break; // Stop checking after first mismatch
+            break;
         }
     }
     if (match) {
         std::cout << "Results match!" << std::endl;
     }
-
-    // --- Free Device Memory ---
-    CHECK_CUDA_ERROR(cudaFree(d_a));
-    CHECK_CUDA_ERROR(cudaFree(d_b));
-    CHECK_CUDA_ERROR(cudaFree(d_c));
-
-    // --- Free Host Memory ---
-    free(h_a);
-    free(h_b);
-    free(h_c_gpu); // Freed renamed variable
-    free(h_c_cpu); // Freed new variable
 
     return 0;
 } 

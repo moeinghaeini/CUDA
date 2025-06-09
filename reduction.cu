@@ -6,6 +6,8 @@
 #include <cmath>   // For fabs in comparison
 #include <limits>  // For numeric_limits
 #include <numeric> // For std::accumulate
+#include <vector>
+#include <memory>
 
 #include <cuda_runtime.h> // CUDA runtime API
 #include "time.h" // Include the timing header
@@ -20,51 +22,89 @@ inline void checkCudaErrors(cudaError_t err, const char *file, int line) {
 }
 #define CHECK_CUDA_ERROR(err) (checkCudaErrors(err, __FILE__, __LINE__))
 
-// --- CPU Reduction Function ---
+// CPU Reduction Function with OpenMP
 double reduceCPU(const double *data, int n) {
     double sum = 0.0;
+    #pragma omp parallel for reduction(+:sum)
     for (int i = 0; i < n; ++i) {
         sum += data[i];
     }
     return sum;
 }
 
-// --- GPU Reduction Kernel ---
-// This kernel performs reduction within each block using shared memory.
-// Each block writes its partial sum to d_partial_sums.
-__global__ void reduceKernel(const double *g_idata, double *g_odata, int n) {
-    // Shared memory for intermediate results within a block
+// Optimized GPU Reduction Kernel
+__global__ void reduceKernel(const double *__restrict__ g_idata, 
+                            double *__restrict__ g_odata, 
+                            int n) {
     extern __shared__ double sdata[];
 
-    // Each thread loads one element from global to shared memory
     unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
-    // Load data into shared memory, handling boundary conditions
-    sdata[tid] = (i < n) ? g_idata[i] : 0.0;
+    // Load first element
+    double sum = (i < n) ? g_idata[i] : 0.0;
+    // Load second element
+    if (i + blockDim.x < n) {
+        sum += g_idata[i + blockDim.x];
+    }
 
-    __syncthreads(); // Ensure all data is loaded before starting reduction
+    sdata[tid] = sum;
+    __syncthreads();
 
-    // Perform reduction in shared memory
-    // Each step halves the number of active threads
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    // Reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
         }
-        __syncthreads(); // Synchronize after each reduction step
+        __syncthreads();
     }
 
-    // Write result for this block to global memory (first thread handles this)
+    // Unroll last warp
+    if (tid < 32) {
+        volatile double *vsmem = sdata;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid + 8];
+        vsmem[tid] += vsmem[tid + 4];
+        vsmem[tid] += vsmem[tid + 2];
+        vsmem[tid] += vsmem[tid + 1];
+    }
+
+    // Write result for this block
     if (tid == 0) {
         g_odata[blockIdx.x] = sdata[0];
     }
 }
 
+// RAII wrapper for CUDA memory
+class CudaMemory {
+public:
+    CudaMemory(size_t size) : size_(size) {
+        CHECK_CUDA_ERROR(cudaMalloc(&ptr_, size));
+    }
+    
+    ~CudaMemory() {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+    
+    void* get() { return ptr_; }
+    const void* get() const { return ptr_; }
+    
+    // Prevent copying
+    CudaMemory(const CudaMemory&) = delete;
+    CudaMemory& operator=(const CudaMemory&) = delete;
+    
+private:
+    void* ptr_ = nullptr;
+    size_t size_;
+};
 
 int main(int argc, char *argv[]) {
     int n;
 
-    // --- Argument Parsing and Size Check ---
+    // Argument parsing and validation
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <array_size>" << std::endl;
         return 1;
@@ -83,81 +123,69 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- Host Memory Allocation ---
-    size_t size = n * sizeof(double);
-    double *h_data = (double*)malloc(size);
-    if (h_data == nullptr) {
-        std::cerr << "Error: Host memory allocation failed for input data." << std::endl;
-        return 1;
-    }
+    // Use RAII for host memory management
+    std::vector<double> h_data(n);
     double h_result_cpu = 0.0;
     double h_result_gpu = 0.0;
 
-    // --- Host Data Initialization ---
+    // Initialize input data
     srand(static_cast<unsigned int>(time(0)));
     for (int i = 0; i < n; ++i) {
-        h_data[i] = (double)rand() / RAND_MAX;
+        h_data[i] = static_cast<double>(rand()) / RAND_MAX;
     }
 
-    // --- CPU Reduction and Timing ---
+    // CPU Reduction and Timing
     std::cout << "Starting CPU reduction..." << std::endl;
     timing::tic();
-    h_result_cpu = reduceCPU(h_data, n);
+    h_result_cpu = reduceCPU(h_data.data(), n);
     double cpu_duration_ms = timing::toc();
     std::cout << "CPU Reduction took: " << cpu_duration_ms << " ms" << std::endl;
     std::cout << "CPU Result: " << h_result_cpu << std::endl;
 
-    // --- GPU Reduction Setup ---
+    // GPU Reduction Setup
     std::cout << "\nStarting GPU reduction..." << std::endl;
-    int threadsPerBlock = 256; // Must be power of 2 for this reduction kernel
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (n + threadsPerBlock * 2 - 1) / (threadsPerBlock * 2);
     size_t partial_sum_size = blocksPerGrid * sizeof(double);
     size_t sharedMemSize = threadsPerBlock * sizeof(double);
 
-    // --- Device Memory Allocation ---
-    double *d_data = nullptr;
-    double *d_partial_sums = nullptr;
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_data, size));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_partial_sums, partial_sum_size));
+    // Use RAII for device memory management
+    CudaMemory d_data(n * sizeof(double));
+    CudaMemory d_partial_sums(partial_sum_size);
 
     // Allocate host memory for partial sums
-    double *h_partial_sums = (double*)malloc(partial_sum_size);
-    if (h_partial_sums == nullptr) {
-        std::cerr << "Error: Host memory allocation failed for partial sums." << std::endl;
-        free(h_data);
-        CHECK_CUDA_ERROR(cudaFree(d_data));
-        CHECK_CUDA_ERROR(cudaFree(d_partial_sums));
-        return 1;
-    }
+    std::vector<double> h_partial_sums(blocksPerGrid);
 
-    // --- Copy Data Host to Device ---
-    CHECK_CUDA_ERROR(cudaMemcpy(d_data, h_data, size, cudaMemcpyHostToDevice));
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_data.get(), h_data.data(), n * sizeof(double), cudaMemcpyHostToDevice));
 
-    // --- Kernel Execution and Timing ---
+    // Execute kernel and time it
     timing::tic();
-    // Kernel launch needs shared memory size specified
-    reduceKernel<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(d_data, d_partial_sums, n);
+    reduceKernel<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(
+        static_cast<const double*>(d_data.get()),
+        static_cast<double*>(d_partial_sums.get()),
+        n
+    );
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-    double gpu_kernel_duration_ms = timing::toc(); // Time only the kernel execution
+    double gpu_kernel_duration_ms = timing::toc();
 
-    // --- Copy Partial Results Device to Host ---
-    CHECK_CUDA_ERROR(cudaMemcpy(h_partial_sums, d_partial_sums, partial_sum_size, cudaMemcpyDeviceToHost));
+    // Copy partial results back to host
+    CHECK_CUDA_ERROR(cudaMemcpy(h_partial_sums.data(), d_partial_sums.get(), partial_sum_size, cudaMemcpyDeviceToHost));
 
-    // --- Final Reduction on Host (summing partial sums) ---
-    // Could launch another small kernel, but summing on host is often fast enough for typical block counts
+    // Final reduction on host
     timing::tic();
-    h_result_gpu = reduceCPU(h_partial_sums, blocksPerGrid); // Re-use CPU reduction for final step
-    // Alternative using std::accumulate:
-    // h_result_gpu = std::accumulate(h_partial_sums, h_partial_sums + blocksPerGrid, 0.0);
+    h_result_gpu = std::accumulate(h_partial_sums.begin(), h_partial_sums.end(), 0.0);
     double final_reduction_duration_ms = timing::toc();
 
     std::cout << "GPU Kernel execution took: " << gpu_kernel_duration_ms << " ms" << std::endl;
     std::cout << "Final reduction on CPU took: " << final_reduction_duration_ms << " ms" << std::endl;
+    std::cout << "Total GPU time: " << gpu_kernel_duration_ms + final_reduction_duration_ms << " ms" << std::endl;
     std::cout << "GPU Result: " << h_result_gpu << std::endl;
+    std::cout << "Speedup: " << cpu_duration_ms / (gpu_kernel_duration_ms + final_reduction_duration_ms) << "x" << std::endl;
 
-    // --- Verification ---
-    double tolerance = std::numeric_limits<double>::epsilon() * n *1000;
+    // Verify results
+    double tolerance = std::numeric_limits<double>::epsilon() * n * 1000;
     double diff = std::fabs(h_result_cpu - h_result_gpu);
 
     std::cout << "\nVerification:" << std::endl;
@@ -171,12 +199,6 @@ int main(int argc, char *argv[]) {
     } else {
         std::cerr << "Results mismatch!" << std::endl;
     }
-
-    // --- Cleanup ---
-    free(h_data);
-    free(h_partial_sums);
-    CHECK_CUDA_ERROR(cudaFree(d_data));
-    CHECK_CUDA_ERROR(cudaFree(d_partial_sums));
 
     return 0;
 } 

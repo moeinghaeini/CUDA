@@ -3,6 +3,18 @@
 #include <vector>
 #include <random>
 #include <chrono>
+#include <metal_stdlib>
+using namespace metal;
+
+// Metal kernel for vector addition
+const char* kernelSource = R"(
+kernel void vectorAdd(device const float* a [[buffer(0)]],
+                     device const float* b [[buffer(1)]],
+                     device float* c [[buffer(2)]],
+                     uint index [[thread_position_in_grid]]) {
+    c[index] = a[index] + b[index];
+}
+)";
 
 class Timer {
     std::chrono::time_point<std::chrono::high_resolution_clock> start;
@@ -38,9 +50,9 @@ int main(int argc, char* argv[]) {
 
     // Create compute pipeline
     NSError* error = nullptr;
-    MTL::Library* library = device->newDefaultLibrary();
+    MTL::Library* library = device->newLibrary(kernelSource, nullptr, &error);
     if (!library) {
-        std::cerr << "Error: Failed to create library." << std::endl;
+        std::cerr << "Error: Failed to create library: " << error->localizedDescription()->utf8String() << std::endl;
         return 1;
     }
 
